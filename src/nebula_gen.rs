@@ -768,10 +768,7 @@ mod tests {
             ];
             let mut arr = [0u8; 32];
             for (p, part) in parts.iter().enumerate() {
-                let bytes = part.to_le_bytes();
-                for i in 0..8 {
-                    arr[p * 8 + i] = bytes[i];
-                }
+                arr[p * 8..p * 8 + 8].copy_from_slice(&part.to_le_bytes());
             }
             BytesN::from_array(env, &arr)
         }

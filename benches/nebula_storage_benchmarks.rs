@@ -107,10 +107,7 @@ impl LegacyNebulaGen {
             splitmix64(master.wrapping_mul(0x0101_0101_0101_0101).wrapping_add(1)),
         ];
         for (p, lane) in lanes.iter().enumerate() {
-            let b = lane.to_le_bytes();
-            for i in 0..8 {
-                arr[p * 8 + i] = b[i];
-            }
+            arr[p * 8..p * 8 + 8].copy_from_slice(&lane.to_le_bytes());
         }
         let _hash = BytesN::from_array(&env, &arr);
 
