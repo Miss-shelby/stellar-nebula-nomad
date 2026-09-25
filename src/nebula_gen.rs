@@ -137,7 +137,7 @@ pub enum DataKey {
 // ── PRNG Engine ──────────────────────────────────────────────
 //
 // Performance notes (Issue #438) — hotspots found while profiling
-// `generate_validated_nebula_layout` with `env.budget()`:
+// `generate_validated_nebula_layout` with `env.cost_estimate().budget()`:
 //   1. Seed extraction issued 32 `BytesN::get` host calls; it now makes a
 //      single `to_array()` call and folds the bytes natively.
 //   2. Anomalies were appended one `push_back` at a time. Each push clones
@@ -426,7 +426,8 @@ impl NebulaGen {
     pub fn clean_expired_layout(env: Env, ship_id: u64) -> Result<bool, NebulaError> {
         let config = Self::require_config(&env)?;
         config.admin.require_auth();
-        Ok(Self::remove_if_expired(&env, &config, ship_id))
+        let now = env.ledger().timestamp();
+        Ok(Self::remove_if_expired(&env, &config, now, ship_id))
     }
 
     /// Sweep a batch of ship layouts, removing any that have expired. Admin only.
@@ -434,10 +435,10 @@ impl NebulaGen {
     pub fn clean_expired_layouts(env: Env, ship_ids: Vec<u64>) -> Result<u32, NebulaError> {
         let config = Self::require_config(&env)?;
         config.admin.require_auth();
+        let now = env.ledger().timestamp();
         let mut removed = 0u32;
-        for i in 0..ship_ids.len() {
-            let ship_id = ship_ids.get(i).unwrap();
-            if Self::remove_if_expired(&env, &config, ship_id) {
+        for ship_id in ship_ids.iter() {
+            if Self::remove_if_expired(&env, &config, now, ship_id) {
                 removed += 1;
             }
         }
@@ -455,21 +456,22 @@ impl NebulaGen {
 
     /// Fetch the active layout for `ship_id`, lazily removing and returning
     /// `None` if it has expired.
+    ///
+    /// The config is read only when a layout exists, and the storage key is
+    /// built once for both the read and the removal.
     fn get_live_layout(env: &Env, ship_id: u64) -> Option<NebulaLayout> {
-        let layout: NebulaLayout = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ActiveLayout(ship_id))?;
+        let key = DataKey::ActiveLayout(ship_id);
+        let store = env.storage().persistent();
+        let layout: NebulaLayout = store.get(&key)?;
 
-        let ttl = match env.storage().instance().get::<DataKey, NebulaConfig>(&DataKey::Config) {
-            Some(c) => c.layout_ttl,
-            None    => DEFAULT_LAYOUT_TTL,
-        };
+        let ttl = env
+            .storage()
+            .instance()
+            .get::<DataKey, NebulaConfig>(&DataKey::Config)
+            .map_or(DEFAULT_LAYOUT_TTL, |c| c.layout_ttl);
 
         if is_expired(env.ledger().timestamp(), layout.generated_at, ttl) {
-            env.storage()
-                .persistent()
-                .remove(&DataKey::ActiveLayout(ship_id));
+            store.remove(&key);
             env.events().publish(
                 (symbol_short!("neb_gen"), symbol_short!("expired")),
                 ship_id,
@@ -480,16 +482,15 @@ impl NebulaGen {
     }
 
     /// Remove the active layout for `ship_id` if expired under `config`.
-    fn remove_if_expired(env: &Env, config: &NebulaConfig, ship_id: u64) -> bool {
-        let layout: Option<NebulaLayout> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ActiveLayout(ship_id));
-        match layout {
-            Some(l) if is_expired(env.ledger().timestamp(), l.generated_at, config.layout_ttl) => {
-                env.storage()
-                    .persistent()
-                    .remove(&DataKey::ActiveLayout(ship_id));
+    ///
+    /// `now` is passed in so batch sweeps read the ledger timestamp once
+    /// rather than once per ship.
+    fn remove_if_expired(env: &Env, config: &NebulaConfig, now: u64, ship_id: u64) -> bool {
+        let key = DataKey::ActiveLayout(ship_id);
+        let store = env.storage().persistent();
+        match store.get::<DataKey, NebulaLayout>(&key) {
+            Some(l) if is_expired(now, l.generated_at, config.layout_ttl) => {
+                store.remove(&key);
                 env.events().publish(
                     (symbol_short!("neb_gen"), symbol_short!("cleaned")),
                     ship_id,
