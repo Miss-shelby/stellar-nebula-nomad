@@ -230,6 +230,12 @@ fn rarity_to_class(rarity: u64) -> ResourceClass {
     }
 }
 
+/// Convert a logical TTL in seconds into ledgers (~5 s per ledger),
+/// saturating at `u32::MAX` instead of silently truncating.
+fn ttl_to_ledgers(ttl_seconds: u64) -> u32 {
+    u32::try_from(ttl_seconds / 5).unwrap_or(u32::MAX)
+}
+
 /// Returns `true` when a layout generated at `generated_at` has outlived
 /// `ttl` seconds. Saturating addition prevents overflow false-positives.
 fn is_expired(now: u64, generated_at: u64, ttl: u64) -> bool {
@@ -304,11 +310,13 @@ impl NebulaGen {
             log!(&env, "[ERROR] NebulaGen: invalid region_id={}", region_id);
             return Err(NebulaError::InvalidRegionId);
         }
-        // Seed must not be all-zero
-        let seed_u64 = extract_seed(&seed);
-        if seed_u64 == 0 {
+        // Seed must not be all-zero. One host call copies the seed into
+        // native memory; validation and folding then run without host calls.
+        let seed_bytes = seed.to_array();
+        if is_zero_bytes32(&seed_bytes) {
             return Err(NebulaError::InvalidSeed);
         }
+        let seed_u64 = fold_seed_bytes(&seed_bytes);
 
         // ── Build entropy master ──────────────────────────────
         let ledger_seq = env.ledger().sequence() as u64;
@@ -322,21 +330,7 @@ impl NebulaGen {
 
         // ── Generate anomalies ────────────────────────────────
         let size = config.default_size;
-        let mut anomalies = Vec::new(&env);
-        for i in 0..size {
-            let x      = derive(master, i, SALT_X) % 1000;
-            let y      = derive(master, i, SALT_Y) % 1000;
-            let rarity = derive(master, i, SALT_R) % 101;
-            let t      = derive(master, i, SALT_T);
-
-            anomalies.push_back(Anomaly {
-                x,
-                y,
-                rarity,
-                anomaly_type:   u64_to_anomaly_type(t),
-                resource_class: rarity_to_class(rarity),
-            });
-        }
+        let anomalies = generate_anomalies(&env, master, size);
 
         // ── Build layout hash ─────────────────────────────────
         let layout_hash = build_layout_hash(&env, master);
@@ -351,17 +345,14 @@ impl NebulaGen {
         };
 
         // ── Persist layout ────────────────────────────────────
-        env.storage()
-            .persistent()
-            .set(&DataKey::ActiveLayout(ship_id), &layout);
+        // Build the storage key once and reuse it for the write and the TTL bump.
+        let key = DataKey::ActiveLayout(ship_id);
+        let store = env.storage().persistent();
+        store.set(&key, &layout);
 
         // Tie storage rent to the configured logical TTL (~5 s per ledger).
-        let ttl_ledgers = (config.layout_ttl / 5) as u32;
-        env.storage().persistent().extend_ttl(
-            &DataKey::ActiveLayout(ship_id),
-            ttl_ledgers,
-            ttl_ledgers,
-        );
+        let ttl_ledgers = ttl_to_ledgers(config.layout_ttl);
+        store.extend_ttl(&key, ttl_ledgers, ttl_ledgers);
 
         // ── Emit event ────────────────────────────────────────
         env.events().publish(
@@ -678,14 +669,14 @@ mod tests {
 
     #[test]
     fn test_has_anomaly_ship_id_zero_rejected() {
-        let (env, client, _) = setup();
+        let (_env, client, _) = setup();
         let result = client.try_has_anomaly(&0u64, &0u32);
         assert_eq!(result, Err(Ok(NebulaError::InvalidShipId)));
     }
 
     #[test]
     fn test_has_anomaly_layout_not_found() {
-        let (env, client, _) = setup();
+        let (_env, client, _) = setup();
         let result = client.try_has_anomaly(&99u64, &0u32);
         assert_eq!(result, Err(Ok(NebulaError::LayoutNotFound)));
     }
@@ -719,6 +710,164 @@ mod tests {
         let l2 = client.generate_validated_nebula_layout(&caller2, &42u64, &100u64, &seed);
 
         assert_eq!(l1.layout_hash, l2.layout_hash);
+    }
+
+    // ── Determinism vs. legacy algorithm (Issue #438) ─────────
+    //
+    // A copy of the pre-optimisation generator, kept here as the reference
+    // the optimised hot path must match bit-for-bit.
+
+    mod legacy {
+        use super::super::{rarity_to_class, u64_to_anomaly_type, Anomaly};
+        use soroban_sdk::{BytesN, Env, Vec};
+
+        pub fn splitmix64(mut z: u64) -> u64 {
+            z = z.wrapping_add(0x9e3779b97f4a7c15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+            z ^ (z >> 31)
+        }
+
+        fn derive(seed: u64, index: u32, salt: u64) -> u64 {
+            splitmix64(seed ^ splitmix64((index as u64).wrapping_mul(0x9e3779b97f4a7c15) ^ salt))
+        }
+
+        fn read_u64(seed: &BytesN<32>, offset: u32) -> u64 {
+            let mut val: u64 = 0;
+            for i in 0..8u32 {
+                val |= (seed.get(offset + i).unwrap_or(0) as u64) << (i * 8);
+            }
+            val
+        }
+
+        pub fn extract_seed(raw: &BytesN<32>) -> u64 {
+            read_u64(raw, 0) ^ read_u64(raw, 8) ^ read_u64(raw, 16) ^ read_u64(raw, 24)
+        }
+
+        pub fn anomalies(env: &Env, master: u64, size: u32) -> Vec<Anomaly> {
+            let mut out = Vec::new(env);
+            for i in 0..size {
+                let rarity = derive(master, i, 0xbf58476d1ce4e5b9) % 101;
+                out.push_back(Anomaly {
+                    x: derive(master, i, 0x9e3779b97f4a7c15) % 1000,
+                    y: derive(master, i, 0x6c62272e07bb0142) % 1000,
+                    rarity,
+                    anomaly_type: u64_to_anomaly_type(derive(master, i, 0x94d049bb133111eb)),
+                    resource_class: rarity_to_class(rarity),
+                });
+            }
+            out
+        }
+
+        pub fn layout_hash(env: &Env, h: u64) -> BytesN<32> {
+            let parts = [
+                splitmix64(h),
+                splitmix64(h ^ 0xdeadcafe12345678),
+                splitmix64(h.wrapping_add(0x12345678deadbeef)),
+                splitmix64(h.wrapping_mul(0x0101010101010101).wrapping_add(1)),
+            ];
+            let mut arr = [0u8; 32];
+            for (p, part) in parts.iter().enumerate() {
+                let bytes = part.to_le_bytes();
+                for i in 0..8 {
+                    arr[p * 8 + i] = bytes[i];
+                }
+            }
+            BytesN::from_array(env, &arr)
+        }
+    }
+
+    fn setup_sized(size: u32) -> (Env, NebulaGenClient<'static>) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set(ledger_info(1, 1_000));
+        let id     = env.register(NebulaGen, ());
+        let client = NebulaGenClient::new(&env, &id);
+        let admin  = Address::generate(&env);
+        client.init(&admin, &size, &1u32, &64u32, &SHORT_TTL);
+        (env, client)
+    }
+
+    fn legacy_master(env: &Env, seed: &BytesN<32>, ship_id: u64, region_id: u64) -> u64 {
+        legacy::splitmix64(legacy::extract_seed(seed))
+            ^ legacy::splitmix64(env.ledger().sequence() as u64)
+            ^ legacy::splitmix64(env.ledger().timestamp())
+            ^ legacy::splitmix64(ship_id)
+            ^ legacy::splitmix64(region_id)
+    }
+
+    #[test]
+    fn optimised_generation_matches_legacy_output() {
+        // Sizes cover: remainder only, exact chunk, chunk + remainder,
+        // several chunks, and the configured maximum.
+        for size in [1u32, 5, 8, 13, 16, 21, 64] {
+            let (env, client) = setup_sized(size);
+            let seed   = valid_seed(&env);
+            let caller = Address::generate(&env);
+            let layout = client.generate_validated_nebula_layout(&caller, &42u64, &7u64, &seed);
+
+            let master = legacy_master(&env, &seed, 42, 7);
+            assert_eq!(layout.size, size);
+            assert_eq!(layout.anomalies, legacy::anomalies(&env, master, size));
+            assert_eq!(layout.layout_hash, legacy::layout_hash(&env, master));
+        }
+    }
+
+    #[test]
+    fn optimised_seed_fold_matches_legacy_for_many_seeds() {
+        let env = Env::default();
+        for n in 1u8..=32 {
+            let mut raw = [0u8; 32];
+            for (i, b) in raw.iter_mut().enumerate() {
+                *b = n.wrapping_mul(31).wrapping_add(i as u8).rotate_left(u32::from(n % 8));
+            }
+            let seed = BytesN::from_array(&env, &raw);
+            assert_eq!(fold_seed_bytes(&seed.to_array()), legacy::extract_seed(&seed));
+        }
+    }
+
+    #[test]
+    fn generation_is_deterministic_across_envs() {
+        let (env_a, client_a) = setup_sized(21);
+        let (env_b, client_b) = setup_sized(21);
+        let a = client_a.generate_validated_nebula_layout(
+            &Address::generate(&env_a), &9u64, &3u64, &valid_seed(&env_a),
+        );
+        let b = client_b.generate_validated_nebula_layout(
+            &Address::generate(&env_b), &9u64, &3u64, &valid_seed(&env_b),
+        );
+        assert_eq!(a.layout_hash.to_array(), b.layout_hash.to_array());
+        assert_eq!(a.anomalies.len(), b.anomalies.len());
+        for i in 0..a.anomalies.len() {
+            assert_eq!(a.anomalies.get(i), b.anomalies.get(i));
+        }
+    }
+
+    #[test]
+    fn non_zero_seed_whose_lanes_cancel_is_accepted() {
+        // Two identical 8-byte lanes XOR to zero. The seed is not all-zero,
+        // so it must be accepted as documented.
+        let (env, client, _) = setup();
+        let mut raw = [0u8; 32];
+        raw[0] = 0xAB;
+        raw[8] = 0xAB;
+        let seed = BytesN::from_array(&env, &raw);
+        let caller = Address::generate(&env);
+        assert!(client
+            .try_generate_validated_nebula_layout(&caller, &1u64, &1u64, &seed)
+            .is_ok());
+    }
+
+    #[test]
+    fn generation_cpu_budget_within_target() {
+        let (env, client) = setup_sized(64);
+        let seed   = valid_seed(&env);
+        let caller = Address::generate(&env);
+        env.budget().reset_default();
+        client.generate_validated_nebula_layout(&caller, &1u64, &1u64, &seed);
+        // Generous ceiling: guards against regressions to per-byte host calls
+        // or per-element vector cloning.
+        assert!(env.budget().cpu_instruction_cost() < 10_000_000);
     }
 
     // ── TTL / lifecycle (from main) ───────────────────────────
