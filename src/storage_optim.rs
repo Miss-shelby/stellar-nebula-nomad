@@ -140,7 +140,8 @@ where
 /// let mut balance = CachedEntry::<DataKey, i128>::new(StorageTier::Instance, DataKey::Fund);
 /// let current = balance.get_or(env, 0);   // 1 host read
 /// balance.set(current - fee);             // no host call
-/// balance.set(balance.get_or(env, 0) - 1); // served from cache
+/// let again = balance.get_or(env, 0);     // served from cache
+/// balance.set(again - 1);
 /// balance.flush(env);                     // 1 host write
 /// ```
 pub struct CachedEntry<K, V> {
@@ -592,7 +593,8 @@ mod tests {
             let mut entry = CachedEntry::<Symbol, u32>::new(StorageTier::Instance, key.clone());
             assert_eq!(entry.get_or(&env, 0), 5);
             entry.set(6);
-            entry.set(entry.get_or(&env, 0) + 1);
+            let staged = entry.get_or(&env, 0);
+            entry.set(staged + 1);
             assert!(entry.is_dirty());
 
             // Nothing written until flush.

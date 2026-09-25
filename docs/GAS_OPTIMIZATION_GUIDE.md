@@ -337,7 +337,8 @@ use crate::storage_optim::{CachedEntry, StorageTier};
 let mut pool = CachedEntry::<DataKey, i128>::new(StorageTier::Instance, DataKey::Pool);
 let balance = pool.get_or(&env, 0);   // 1 host read
 pool.set(balance - fee);              // in memory
-pool.set(pool.get_or(&env, 0) + tip); // served from cache
+let staged = pool.get_or(&env, 0);   // served from cache
+pool.set(staged + tip);
 pool.flush(&env);                     // 1 host write
 ```
 
