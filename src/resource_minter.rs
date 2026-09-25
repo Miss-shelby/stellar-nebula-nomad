@@ -16,6 +16,7 @@ use soroban_sdk::{
 
 use crate::nebula_gen::{NebulaError as NebulaGenError, NebulaGen};
 use crate::rate_limiter::{check_rate_limit, Operation, RateLimitError};
+use crate::economics::anti_whale::{process_anti_whale_action, AntiWhaleError};
 
 pub type AssetId = ResourceType;
 
@@ -78,6 +79,18 @@ pub enum MinterError {
     ArithmeticOverflow = 204,
     /// The account holds less than the requested debit amount (Issue #281).
     InsufficientBalance = 205,
+    /// Requested amount exceeds anti-whale daily operation cap (Issue #455).
+    DailyCapExceeded = 206,
+}
+
+impl From<AntiWhaleError> for MinterError {
+    fn from(err: AntiWhaleError) -> Self {
+        match err {
+            AntiWhaleError::DailyCapExceeded => MinterError::DailyCapExceeded,
+            AntiWhaleError::ArithmeticOverflow => MinterError::ArithmeticOverflow,
+            AntiWhaleError::InvalidAmount => MinterError::InvalidAmount,
+        }
+    }
 }
 
 impl From<RateLimitError> for MinterError {
