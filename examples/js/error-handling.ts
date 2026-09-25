@@ -126,7 +126,9 @@ async function main() {
     }
   }
 
-  // 3. Same number, different module: #3 here is NotOwner, not InvalidSeed.
+  // 3. Same number, different module: an unknown ship returns #2, which is
+  //    ShipNotFound in ship_nft but AlreadyInitialized in nebula_gen.
+  //    NotFound is not retryable, so withRetry fails fast here.
   requireContractId(config.contractId, "NEBULA_CONTRACT_ID");
   try {
     await withRetry("ship_nft", () =>
