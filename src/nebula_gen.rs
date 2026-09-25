@@ -195,11 +195,10 @@ fn generate_anomalies(env: &Env, master: u64, size: u32) -> Vec<Anomaly> {
             let offset = k as u32;
             make_anomaly(master, base + offset)
         });
-        let chunk = Vec::from_array(env, chunk);
         if base == 0 {
-            anomalies = chunk;
+            anomalies = Vec::from_array(env, chunk);
         } else {
-            anomalies.append(&chunk);
+            anomalies.extend_from_array(chunk);
         }
         base += chunk_len;
     }
@@ -863,11 +862,11 @@ mod tests {
         let (env, client) = setup_sized(64);
         let seed   = valid_seed(&env);
         let caller = Address::generate(&env);
-        env.budget().reset_default();
+        env.cost_estimate().budget().reset_default();
         client.generate_validated_nebula_layout(&caller, &1u64, &1u64, &seed);
         // Generous ceiling: guards against regressions to per-byte host calls
         // or per-element vector cloning.
-        assert!(env.budget().cpu_instruction_cost() < 10_000_000);
+        assert!(env.cost_estimate().budget().cpu_instruction_cost() < 10_000_000);
     }
 
     // ── TTL / lifecycle (from main) ───────────────────────────
