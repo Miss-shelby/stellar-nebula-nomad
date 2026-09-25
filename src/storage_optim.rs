@@ -1,5 +1,6 @@
 use soroban_sdk::{
-    contracterror, contracttype, symbol_short, Address, BytesN, Env, Symbol, Vec,
+    contracterror, contracttype, symbol_short, Address, BytesN, Env, IntoVal, Symbol,
+    TryFromVal, Val, Vec,
 };
 
 // ─── Constants ────────────────────────────────────────────────────────────
@@ -90,6 +91,120 @@ pub struct OptimResult {
     pub key: Symbol,
     pub ttl_applied: u32,
     pub instruction_savings_pct: u32,
+}
+
+// ─── Read-Through / Write-Back Cache (Issue #437) ─────────────────────────
+//
+// Contract functions often read the same key several times: once to
+// validate, again to update, sometimes a third time to emit an event.
+// Every read is a host call that deserialises the stored value.
+// `CachedEntry` loads a key at most once per invocation, serves later
+// reads from memory, and collects writes so only the final value is
+// written in a single `flush`.
+
+/// Which Soroban storage tier a cached entry lives in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageTier {
+    Instance,
+    Persistent,
+    Temporary,
+}
+
+fn tier_get<K, V>(env: &Env, tier: StorageTier, key: &K) -> Option<V>
+where
+    K: IntoVal<Env, Val>,
+    V: TryFromVal<Env, Val>,
+{
+    match tier {
+        StorageTier::Instance => env.storage().instance().get(key),
+        StorageTier::Persistent => env.storage().persistent().get(key),
+        StorageTier::Temporary => env.storage().temporary().get(key),
+    }
+}
+
+fn tier_set<K, V>(env: &Env, tier: StorageTier, key: &K, value: &V)
+where
+    K: IntoVal<Env, Val>,
+    V: IntoVal<Env, Val>,
+{
+    match tier {
+        StorageTier::Instance => env.storage().instance().set(key, value),
+        StorageTier::Persistent => env.storage().persistent().set(key, value),
+        StorageTier::Temporary => env.storage().temporary().set(key, value),
+    }
+}
+
+/// A single storage entry with lazy loading and deferred (batched) writes.
+///
+/// ```ignore
+/// let mut balance = CachedEntry::<DataKey, i128>::new(StorageTier::Instance, DataKey::Fund);
+/// let current = balance.get_or(env, 0);   // 1 host read
+/// balance.set(current - fee);             // no host call
+/// balance.set(balance.get_or(env, 0) - 1); // served from cache
+/// balance.flush(env);                     // 1 host write
+/// ```
+pub struct CachedEntry<K, V> {
+    tier: StorageTier,
+    key: K,
+    value: Option<V>,
+    loaded: bool,
+    dirty: bool,
+}
+
+impl<K, V> CachedEntry<K, V>
+where
+    K: IntoVal<Env, Val>,
+    V: IntoVal<Env, Val> + TryFromVal<Env, Val> + Clone,
+{
+    /// Create a cache for `key` in `tier`. No storage access happens yet.
+    pub fn new(tier: StorageTier, key: K) -> Self {
+        Self {
+            tier,
+            key,
+            value: None,
+            loaded: false,
+            dirty: false,
+        }
+    }
+
+    /// Return the value, reading storage only on first access.
+    pub fn get(&mut self, env: &Env) -> Option<V> {
+        if !self.loaded {
+            self.value = tier_get(env, self.tier, &self.key);
+            self.loaded = true;
+        }
+        self.value.clone()
+    }
+
+    /// Return the value, or `default` when the entry is absent.
+    pub fn get_or(&mut self, env: &Env, default: V) -> V {
+        self.get(env).unwrap_or(default)
+    }
+
+    /// Stage a new value. Storage is written only on [`CachedEntry::flush`].
+    pub fn set(&mut self, value: V) {
+        self.value = Some(value);
+        self.loaded = true;
+        self.dirty = true;
+    }
+
+    /// `true` when a staged value has not been written yet.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Write the staged value (if any) with a single host call.
+    /// Returns `true` when a write happened.
+    pub fn flush(&mut self, env: &Env) -> bool {
+        if !self.dirty {
+            return false;
+        }
+        if let Some(v) = &self.value {
+            tier_set(env, self.tier, &self.key, v);
+        }
+        self.dirty = false;
+        true
+    }
 }
 
 // ─── Re-Entrancy Guard ───────────────────────────────────────────────────
