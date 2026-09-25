@@ -155,6 +155,10 @@ name = "test_seasonal_content"
 path = "tests/gameplay/test_seasonal_content.rs"
 
 [[test]]
+name = "test_seasonal_events"
+path = "tests/gameplay/test_seasonal_events.rs"
+
+[[test]]
 name = "test_ship_upgrade"
 path = "tests/gameplay/test_ship_upgrade.rs"
 
