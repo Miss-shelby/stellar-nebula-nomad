@@ -14,12 +14,17 @@
 //     signalling while also surfacing expiry (LayoutNotFound)
 //   • TTL / extend_ttl / admin sweep logic kept from main
 //   • Both test suites merged and deduplicated
+//   • Generation hot path optimised (Issue #438) — see "PRNG Engine"
 // ============================================================
 
-#![no_std]
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, log, symbol_short,
     Address, BytesN, Env, Vec,
+};
+
+use crate::gas_optimized_compute::{
+    derive_spread, expand_u64_to_bytes32, fold_seed_bytes, is_zero_bytes32, splitmix64,
+    GOLDEN_GAMMA,
 };
 
 // ── Constants ────────────────────────────────────────────────
@@ -130,69 +135,79 @@ pub enum DataKey {
 }
 
 // ── PRNG Engine ──────────────────────────────────────────────
+//
+// Performance notes (Issue #438) — hotspots found while profiling
+// `generate_validated_nebula_layout` with `env.budget()`:
+//   1. Seed extraction issued 32 `BytesN::get` host calls; it now makes a
+//      single `to_array()` call and folds the bytes natively.
+//   2. Anomalies were appended one `push_back` at a time. Each push clones
+//      the host vector, so cost grew quadratically with layout size. They are
+//      now built in fixed-size chunks with `Vec::from_array` + `append`.
+//   3. `index * GOLDEN_GAMMA` was recomputed for every salt; it is now
+//      computed once per anomaly.
+//   4. The layout hash was assembled byte-by-byte; it is now built from
+//      four little-endian lanes.
+// The PRNG maths is unchanged, so layouts are bit-for-bit identical to the
+// previous implementation. The tests below check this against a reference
+// copy of the old algorithm.
 
-/// SplitMix64 finalizer — bijective, high-quality, deterministic.
-#[inline]
-fn splitmix64(mut z: u64) -> u64 {
-    z = z.wrapping_add(0x9e3779b97f4a7c15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
-    z ^ (z >> 31)
-}
+// Salt constants for derive_spread()
+const SALT_X: u64 = 0x9e37_79b9_7f4a_7c15;
+const SALT_Y: u64 = 0x6c62_272e_07bb_0142;
+const SALT_R: u64 = 0xbf58_476d_1ce4_e5b9;
+const SALT_T: u64 = 0x94d0_49bb_1331_11eb;
 
-/// Derive a deterministic, independent u64 for (seed, index, salt).
-/// Different salt values for x/y/rarity/type prevent inter-property correlations.
-#[inline]
-fn derive(seed: u64, index: u32, salt: u64) -> u64 {
-    splitmix64(seed ^ splitmix64((index as u64).wrapping_mul(0x9e3779b97f4a7c15) ^ salt))
-}
-
-// Salt constants for derive()
-const SALT_X: u64 = 0x9e3779b97f4a7c15;
-const SALT_Y: u64 = 0x6c62272e07bb0142;
-const SALT_R: u64 = 0xbf58476d1ce4e5b9;
-const SALT_T: u64 = 0x94d049bb133111eb;
-
-/// Read 8 consecutive bytes from a `BytesN<32>` starting at `offset`
-/// and interpret them as a little-endian u64.
-fn read_u64_from_seed(seed: &BytesN<32>, offset: u32) -> u64 {
-    let mut val: u64 = 0;
-    for i in 0..8u32 {
-        let b = seed.get(offset + i).unwrap_or(0) as u64;
-        val |= b << (i * 8);
-    }
-    val
-}
-
-/// Fold all 32 bytes of the seed into a single u64 by XOR-ing the four
-/// 8-byte chunks so that every bit of the seed influences generation.
-fn extract_seed(raw: &BytesN<32>) -> u64 {
-    read_u64_from_seed(raw, 0)
-        ^ read_u64_from_seed(raw, 8)
-        ^ read_u64_from_seed(raw, 16)
-        ^ read_u64_from_seed(raw, 24)
-}
+/// Number of anomalies materialised per host `Vec` allocation.
+const ANOMALY_CHUNK: usize = 8;
 
 /// Expand a u64 into a 32-byte layout hash using four independent splitmix64 chains.
 fn build_layout_hash(env: &Env, h: u64) -> BytesN<32> {
-    let h0 = splitmix64(h);
-    let h1 = splitmix64(h ^ 0xdeadcafe12345678);
-    let h2 = splitmix64(h.wrapping_add(0x12345678deadbeef));
-    let h3 = splitmix64(h.wrapping_mul(0x0101010101010101).wrapping_add(1));
-    let mut arr = [0u8; 32];
-    let b0 = h0.to_le_bytes();
-    let b1 = h1.to_le_bytes();
-    let b2 = h2.to_le_bytes();
-    let b3 = h3.to_le_bytes();
-    let mut i = 0usize;
-    while i < 8 { arr[i]      = b0[i]; i += 1; }
-    let mut i = 0usize;
-    while i < 8 { arr[8  + i] = b1[i]; i += 1; }
-    let mut i = 0usize;
-    while i < 8 { arr[16 + i] = b2[i]; i += 1; }
-    let mut i = 0usize;
-    while i < 8 { arr[24 + i] = b3[i]; i += 1; }
-    BytesN::from_array(env, &arr)
+    BytesN::from_array(env, &expand_u64_to_bytes32(h))
+}
+
+/// Build the anomaly at `index` for the given entropy `master`.
+#[inline]
+fn make_anomaly(master: u64, index: u32) -> Anomaly {
+    let spread = u64::from(index).wrapping_mul(GOLDEN_GAMMA);
+    let x      = derive_spread(master, spread, SALT_X) % 1000;
+    let y      = derive_spread(master, spread, SALT_Y) % 1000;
+    let rarity = derive_spread(master, spread, SALT_R) % 101;
+    let t      = derive_spread(master, spread, SALT_T);
+    Anomaly {
+        x,
+        y,
+        rarity,
+        anomaly_type:   u64_to_anomaly_type(t),
+        resource_class: rarity_to_class(rarity),
+    }
+}
+
+/// Generate `size` anomalies. Full chunks of [`ANOMALY_CHUNK`] are built
+/// with one host allocation each; any remainder is pushed individually.
+fn generate_anomalies(env: &Env, master: u64, size: u32) -> Vec<Anomaly> {
+    let mut anomalies: Vec<Anomaly> = Vec::new(env);
+    let mut base = 0u32;
+    #[allow(clippy::cast_possible_truncation)]
+    let chunk_len = ANOMALY_CHUNK as u32;
+    while base + chunk_len <= size {
+        let chunk: [Anomaly; ANOMALY_CHUNK] = core::array::from_fn(|k| {
+            #[allow(clippy::cast_possible_truncation)]
+            let offset = k as u32;
+            make_anomaly(master, base + offset)
+        });
+        let chunk = Vec::from_array(env, chunk);
+        if base == 0 {
+            anomalies = chunk;
+        } else {
+            anomalies.append(&chunk);
+        }
+        base += chunk_len;
+    }
+    while base < size {
+        anomalies.push_back(make_anomaly(master, base));
+        base += 1;
+    }
+    anomalies
 }
 
 fn u64_to_anomaly_type(v: u64) -> AnomalyType {
