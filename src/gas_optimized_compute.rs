@@ -1,5 +1,10 @@
-/// Gas-optimized computation utilities
-/// Provides efficient algorithms and patterns for common computations
+//! Gas-optimized computation utilities.
+//! Provides efficient algorithms and patterns for common computations.
+//!
+//! This is a shared utility library: not every helper is called in every
+//! build, so unused helpers are allowed rather than reported as dead code.
+#![allow(dead_code)]
+
 use soroban_sdk::{Env, Vec, BytesN};
 
 /// Fast hash for small inputs (optimized for gas)
