@@ -1,7 +1,4 @@
-#![no_std]
-use soroban_sdk::{
-    contracterror, contracttype, symbol_short, Address, Env, Symbol,
-};
+use soroban_sdk::{contracterror, contracttype, symbol_short, Address, Env};
 
 /// Timeframe in seconds for daily activity window (24 hours = 86,400 seconds).
 pub const DAILY_WINDOW_SECONDS: u64 = 86_400;
@@ -65,9 +62,7 @@ pub fn get_daily_cap(env: &Env) -> u64 {
 
 /// Set custom daily cap.
 pub fn set_daily_cap(env: &Env, cap: u64) {
-    env.storage()
-        .instance()
-        .set(&AntiWhaleKey::DailyCap, &cap);
+    env.storage().instance().set(&AntiWhaleKey::DailyCap, &cap);
 }
 
 /// Check if an account is exempt from anti-whale limits.

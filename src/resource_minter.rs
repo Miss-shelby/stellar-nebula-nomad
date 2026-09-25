@@ -134,18 +134,22 @@ impl ResourceMinterContract {
             _ => MinterError::NoLayoutForShip,
         })?;
 
+        // ── Anti-Whale check (Issue #455) ─────────────────────
+        let (effective_amount, _progressive_fee) =
+            process_anti_whale_action(env, &caller, amount)?;
+
         // ── Update balances (checked: Issue #239) ──────────────
         let balance_key = MinterKey::Balance(caller.clone(), resource_type.clone());
         let current: u64 = env.storage().persistent().get(&balance_key).unwrap_or(0);
         let new_balance = current
-            .checked_add(amount)
+            .checked_add(effective_amount)
             .ok_or(MinterError::ArithmeticOverflow)?;
         env.storage().persistent().set(&balance_key, &new_balance);
 
         let supply_key = MinterKey::TotalSupply(resource_type.clone());
         let supply: u64 = env.storage().persistent().get(&supply_key).unwrap_or(0);
         let new_supply = supply
-            .checked_add(amount)
+            .checked_add(effective_amount)
             .ok_or(MinterError::ArithmeticOverflow)?;
         env.storage().persistent().set(&supply_key, &new_supply);
 
@@ -156,21 +160,21 @@ impl ResourceMinterContract {
         let minted_key = MinterKey::TotalMinted(resource_type.clone());
         let minted: u64 = env.storage().persistent().get(&minted_key).unwrap_or(0);
         let new_minted = minted
-            .checked_add(amount)
+            .checked_add(effective_amount)
             .ok_or(MinterError::ArithmeticOverflow)?;
         env.storage().persistent().set(&minted_key, &new_minted);
 
         let record = ResourceRecord {
             owner: caller.clone(),
             resource_type: resource_type.clone(),
-            amount,
+            amount: effective_amount,
             minted_at: env.ledger().timestamp(),
         };
 
         // ── Emit event ─────────────────────────────────────────
         env.events().publish(
             (symbol_short!("Minter"), symbol_short!("minted")),
-            (caller, resource_type, amount),
+            (caller, resource_type, effective_amount),
         );
 
         Ok(record)
