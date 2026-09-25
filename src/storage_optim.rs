@@ -228,10 +228,14 @@ pub fn guard_reentrancy(env: &Env) -> Result<(), StorageError> {
 }
 
 /// Release the global re-entrancy lock.
+///
+/// The entry is removed rather than overwritten with `false`: instance
+/// storage is loaded on every invocation, so an idle lock should not stay
+/// in it. `guard_reentrancy` treats an absent entry as unlocked.
 pub fn release_guard(env: &Env) {
     env.storage()
         .instance()
-        .set(&StorageKey::ReentrancyGuard, &false);
+        .remove(&StorageKey::ReentrancyGuard);
 }
 
 // ─── Bump Storage ─────────────────────────────────────────────────────────
@@ -257,14 +261,13 @@ pub fn store_with_bump(
         ttl_ledgers: ttl,
     };
 
-    env.storage()
-        .persistent()
-        .set(&StorageKey::OptimEntry(key.clone()), &entry);
+    // Build the storage key once for both the write and the TTL bump.
+    let storage_key = StorageKey::OptimEntry(key.clone());
+    let store = env.storage().persistent();
+    store.set(&storage_key, &entry);
 
     // Extend the TTL via bump to reduce rent overhead.
-    env.storage()
-        .persistent()
-        .extend_ttl(&StorageKey::OptimEntry(key.clone()), ttl, config.max_ttl);
+    store.extend_ttl(&storage_key, ttl, config.max_ttl);
 
     let result = OptimResult {
         key: key.clone(),
@@ -319,12 +322,11 @@ pub fn store_ship_nebula(
     };
 
     let key = StorageKey::ShipNebula(ship_id, nebula_id);
-    env.storage().persistent().set(&key, &data);
+    let store = env.storage().persistent();
+    store.set(&key, &data);
 
     let config = get_bump_config(env);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, config.default_ttl, config.max_ttl);
+    store.extend_ttl(&key, config.default_ttl, config.max_ttl);
 
     env.events().publish(
         (symbol_short!("storage"), symbol_short!("packed")),
@@ -355,19 +357,24 @@ pub fn get_ship_nebula(
 /// Track the number of reads in a single transaction and enforce the
 /// burst-read safety limit.
 fn track_burst_read(env: &Env) -> Result<(), StorageError> {
-    let count: u32 = env
-        .storage()
-        .instance()
+    track_burst_reads(env, 1)
+}
+
+/// Account for `n` reads with one counter read and one counter write,
+/// instead of a read and a write per item. Used by the batch getters.
+fn track_burst_reads(env: &Env, n: u32) -> Result<(), StorageError> {
+    let instance = env.storage().instance();
+    let count: u32 = instance
         .get(&StorageKey::BurstReadCounter)
         .unwrap_or(0);
 
-    if count >= MAX_BURST_READS {
+    // Reject if any of the `n` reads would cross the limit.
+    let new_count = count.saturating_add(n);
+    if count >= MAX_BURST_READS || new_count > MAX_BURST_READS {
         return Err(StorageError::BurstLimitExceeded);
     }
 
-    env.storage()
-        .instance()
-        .set(&StorageKey::BurstReadCounter, &(count + 1));
+    instance.set(&StorageKey::BurstReadCounter, &new_count);
 
     Ok(())
 }
@@ -479,33 +486,36 @@ pub fn batch_store_with_bump(
     keys: Vec<Symbol>,
     values: Vec<BytesN<64>>,
 ) -> Result<Vec<OptimResult>, StorageError> {
+    // Validate before taking the lock so a malformed batch cannot leave the
+    // guard held (previously a length mismatch panicked mid-loop).
+    if keys.len() != values.len() {
+        return Err(StorageError::InvalidKey);
+    }
+
     guard_reentrancy(env)?;
 
+    // Loop-invariant values are read once for the whole batch.
     let config = get_bump_config(env);
     let ttl = config.default_ttl;
+    let now = env.ledger().timestamp();
+    let store = env.storage().persistent();
 
     let mut results = Vec::new(env);
 
-    for i in 0..keys.len() {
-        let key = keys.get(i).unwrap();
-        let value = values.get(i).unwrap();
-
+    for (key, value) in keys.iter().zip(values.iter()) {
         let entry = OptimizedEntry {
             key: key.clone(),
             data: value,
-            created_at: env.ledger().timestamp(),
+            created_at: now,
             ttl_ledgers: ttl,
         };
 
-        env.storage()
-            .persistent()
-            .set(&StorageKey::OptimEntry(key.clone()), &entry);
-        env.storage()
-            .persistent()
-            .extend_ttl(&StorageKey::OptimEntry(key.clone()), ttl, config.max_ttl);
+        let storage_key = StorageKey::OptimEntry(key.clone());
+        store.set(&storage_key, &entry);
+        store.extend_ttl(&storage_key, ttl, config.max_ttl);
 
         results.push_back(OptimResult {
-            key: key.clone(),
+            key,
             ttl_applied: ttl,
             instruction_savings_pct: 30,
         });
@@ -519,4 +529,44 @@ pub fn batch_store_with_bump(
     release_guard(env);
 
     Ok(results)
+}
+
+/// Batch-read optimized entries with a single burst-counter update.
+///
+/// Returns `EntryNotFound` if any key is missing.
+pub fn get_optimized_entries(
+    env: &Env,
+    keys: Vec<Symbol>,
+) -> Result<Vec<OptimizedEntry>, StorageError> {
+    track_burst_reads(env, keys.len())?;
+
+    let store = env.storage().persistent();
+    let mut out = Vec::new(env);
+    for key in keys.iter() {
+        let entry: OptimizedEntry = store
+            .get(&StorageKey::OptimEntry(key))
+            .ok_or(StorageError::EntryNotFound)?;
+        out.push_back(entry);
+    }
+    Ok(out)
+}
+
+/// Batch-read ship-nebula records for one ship across several nebulae
+/// with a single burst-counter update.
+pub fn get_ship_nebula_batch(
+    env: &Env,
+    ship_id: u64,
+    nebula_ids: Vec<u64>,
+) -> Result<Vec<ShipNebulaData>, StorageError> {
+    track_burst_reads(env, nebula_ids.len())?;
+
+    let store = env.storage().persistent();
+    let mut out = Vec::new(env);
+    for nebula_id in nebula_ids.iter() {
+        let data: ShipNebulaData = store
+            .get(&StorageKey::ShipNebula(ship_id, nebula_id))
+            .ok_or(StorageError::EntryNotFound)?;
+        out.push_back(data);
+    }
+    Ok(out)
 }
