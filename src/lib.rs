@@ -265,8 +265,9 @@ pub use storage_optim::{
     store_with_bump, get_optimized_entry, batch_store_with_bump, guard_reentrancy,
     release_guard, store_ship_nebula, get_ship_nebula, initialize_bump_config,
     update_bump_config, get_bump_config, set_upgrade_target, get_upgrade_target,
-    reset_burst_counter, StorageError, OptimizedEntry, ShipNebulaData, OptimResult,
-    BumpConfig, DEFAULT_BUMP_TTL, MAX_BUMP_TTL, MAX_BURST_READS,
+    reset_burst_counter, get_optimized_entries, get_ship_nebula_batch, StorageError,
+    OptimizedEntry, ShipNebulaData, OptimResult, BumpConfig, CachedEntry, StorageTier,
+    DEFAULT_BUMP_TTL, MAX_BUMP_TTL, MAX_BURST_READS,
 };
 pub use state_snapshot::{
     take_snapshot, restore_from_snapshot, get_snapshot, get_ship_snapshots,
