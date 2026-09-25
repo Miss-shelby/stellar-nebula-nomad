@@ -570,3 +570,119 @@ pub fn get_ship_nebula_batch(
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nebula_gen::NebulaGen;
+    use soroban_sdk::{symbol_short, testutils::Address as _, Address, Env};
+
+    fn host(env: &Env) -> Address {
+        env.register(NebulaGen, ())
+    }
+
+    #[test]
+    fn cached_entry_reads_once_and_writes_on_flush() {
+        let env = Env::default();
+        let id = host(&env);
+        env.as_contract(&id, || {
+            let key = symbol_short!("cnt");
+            env.storage().instance().set(&key, &5u32);
+
+            let mut entry = CachedEntry::<Symbol, u32>::new(StorageTier::Instance, key.clone());
+            assert_eq!(entry.get_or(&env, 0), 5);
+            entry.set(6);
+            entry.set(entry.get_or(&env, 0) + 1);
+            assert!(entry.is_dirty());
+
+            // Nothing written until flush.
+            assert_eq!(env.storage().instance().get::<_, u32>(&key), Some(5));
+            assert!(entry.flush(&env));
+            assert_eq!(env.storage().instance().get::<_, u32>(&key), Some(7));
+
+            // A second flush with no staged change writes nothing.
+            assert!(!entry.flush(&env));
+        });
+    }
+
+    #[test]
+    fn cached_entry_absent_key_uses_default() {
+        let env = Env::default();
+        let id = host(&env);
+        env.as_contract(&id, || {
+            let mut entry =
+                CachedEntry::<Symbol, u64>::new(StorageTier::Persistent, symbol_short!("none"));
+            assert_eq!(entry.get(&env), None);
+            assert_eq!(entry.get_or(&env, 42), 42);
+            assert!(!entry.flush(&env));
+        });
+    }
+
+    #[test]
+    fn release_guard_clears_lock_entry() {
+        let env = Env::default();
+        let id = host(&env);
+        env.as_contract(&id, || {
+            guard_reentrancy(&env).unwrap();
+            assert_eq!(guard_reentrancy(&env), Err(StorageError::ReentrancyDetected));
+            release_guard(&env);
+            assert!(!env.storage().instance().has(&StorageKey::ReentrancyGuard));
+            assert!(guard_reentrancy(&env).is_ok());
+        });
+    }
+
+    #[test]
+    fn batch_store_rejects_mismatched_lengths_without_holding_lock() {
+        let env = Env::default();
+        let id = host(&env);
+        env.as_contract(&id, || {
+            let keys = Vec::from_array(&env, [symbol_short!("a"), symbol_short!("b")]);
+            let values = Vec::from_array(&env, [BytesN::from_array(&env, &[0u8; 64])]);
+            assert_eq!(
+                batch_store_with_bump(&env, keys, values),
+                Err(StorageError::InvalidKey)
+            );
+            assert!(guard_reentrancy(&env).is_ok());
+        });
+    }
+
+    #[test]
+    fn batch_reads_count_once_against_burst_limit() {
+        let env = Env::default();
+        let id = host(&env);
+        let admin = Address::generate(&env);
+        env.mock_all_auths();
+        env.as_contract(&id, || {
+            initialize_bump_config(&env, &admin);
+            let keys = Vec::from_array(&env, [symbol_short!("x"), symbol_short!("y")]);
+            for k in keys.iter() {
+                store_with_bump(&env, k, BytesN::from_array(&env, &[9u8; 64])).unwrap();
+            }
+            reset_burst_counter(&env);
+            let entries = get_optimized_entries(&env, keys).unwrap();
+            assert_eq!(entries.len(), 2);
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&StorageKey::BurstReadCounter)
+                .unwrap();
+            assert_eq!(count, 2);
+        });
+    }
+
+    #[test]
+    fn batch_reads_reject_when_exceeding_burst_limit() {
+        let env = Env::default();
+        let id = host(&env);
+        env.as_contract(&id, || {
+            env.storage()
+                .instance()
+                .set(&StorageKey::BurstReadCounter, &(MAX_BURST_READS - 1));
+            let keys = Vec::from_array(&env, [symbol_short!("p"), symbol_short!("q")]);
+            assert_eq!(
+                get_optimized_entries(&env, keys),
+                Err(StorageError::BurstLimitExceeded)
+            );
+        });
+    }
+}
