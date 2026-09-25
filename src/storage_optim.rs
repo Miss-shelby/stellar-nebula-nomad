@@ -638,10 +638,10 @@ mod tests {
         env.as_contract(&id, || {
             let keys = Vec::from_array(&env, [symbol_short!("a"), symbol_short!("b")]);
             let values = Vec::from_array(&env, [BytesN::from_array(&env, &[0u8; 64])]);
-            assert_eq!(
+            assert!(matches!(
                 batch_store_with_bump(&env, keys, values),
                 Err(StorageError::InvalidKey)
-            );
+            ));
             assert!(guard_reentrancy(&env).is_ok());
         });
     }
