@@ -21,7 +21,7 @@ pub enum SessionKey {
 // ─── Data Types ───────────────────────────────────────────────────────────────
 
 /// A timed nebula exploration session tied to a ship.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 #[contracttype]
 pub struct Session {
     pub id: u64,
